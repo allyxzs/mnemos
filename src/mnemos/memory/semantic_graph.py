@@ -1,5 +1,6 @@
 from collections import defaultdict
 from typing import Dict, List, Optional, Set, Tuple
+
 from mnemos.core.models import ConflictRecord, SemanticEdge
 
 
@@ -38,7 +39,6 @@ class SemanticKnowledgeGraph:
 
         conflict_detected: Optional[ConflictRecord] = None
 
-        # Verifica atualização ou contradição dialética em relações funcionais (1:1)
         for edge in list(self.adj[src]):
             if edge.relation == rel:
                 if edge.target_id == tgt and edge.negated == negated:
@@ -56,7 +56,6 @@ class SemanticKnowledgeGraph:
                         resolution="SUPERSEDED_BY_NEWER_EVIDENCE",
                     )
                     self.conflicts.append(conflict_detected)
-                    # Atenua peso da memória antiga superada
                     edge.weight = max(0.1, edge.weight * 0.4)
 
         new_edge = SemanticEdge(

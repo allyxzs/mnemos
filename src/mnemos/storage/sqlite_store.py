@@ -2,11 +2,12 @@ import json
 import sqlite3
 from pathlib import Path
 from typing import Dict, List
+
 from mnemos.core.models import MemoryNode, MemoryTier, SemanticEdge
 
 
 class SQLiteMemoryStore:
-    """Persistência transacional em SQLite com modo WAL para durabilidade de estado."""
+    """Persistência transacional em SQLite com modo WAL para durabilidade e hidratação."""
 
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = str(db_path)
@@ -121,3 +122,21 @@ class SQLiteMemoryStore:
                 )
                 nodes[node.id] = node
         return nodes
+
+    def load_edges(self) -> List[SemanticEdge]:
+        edges: List[SemanticEdge] = []
+        with self._get_conn() as conn:
+            cursor = conn.execute("SELECT * FROM semantic_edges ORDER BY updated_at ASC")
+            for row in cursor.fetchall():
+                edges.append(
+                    SemanticEdge(
+                        source_id=row[0],
+                        relation=row[1],
+                        target_id=row[2],
+                        weight=row[3],
+                        negated=bool(row[4]),
+                        evidence_hashes=json.loads(row[5]),
+                        updated_at=row[6],
+                    )
+                )
+        return edges

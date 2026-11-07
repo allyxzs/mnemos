@@ -1,11 +1,13 @@
 from __future__ import annotations
+
 import hashlib
 import json
 import math
 import time
 from enum import Enum
 from typing import Any, Dict, List, Optional
-from pydantic import BaseModel, Field, computed_field
+
+from pydantic import BaseModel, Field
 
 
 class MemoryTier(str, Enum):
@@ -27,14 +29,12 @@ class MemoryNode(BaseModel):
     parent_hash: Optional[str] = None
     hmac_signature: Optional[str] = None
 
-    @computed_field
     @property
     def content_hash(self) -> str:
         payload = json.dumps(
             {
                 "id": self.id,
                 "content": self.content,
-                "tier": self.tier.value,
                 "created_at": round(self.created_at, 4),
                 "parent_hash": self.parent_hash,
             },

@@ -3,8 +3,10 @@ import hashlib
 import math
 import time
 import uuid
+from collections import Counter
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
 from mnemos.core.ledger import MerkleMemoryLedger
 from mnemos.core.models import MemoryNode, MemoryTier
 from mnemos.memory.semantic_graph import SemanticKnowledgeGraph
@@ -23,13 +25,18 @@ def cosine_similarity(v1: List[float], v2: List[float]) -> float:
     return dot / (norm1 * norm2)
 
 
+def tokenize(text: str) -> List[str]:
+    cleaned = "".join(c.lower() if c.isalnum() else " " for c in text)
+    return [t for t in cleaned.split() if len(t) > 1]
+
+
 class MnemosEngineV2:
     """
-    Orquestrador Cognitivo Mnemos v2.0:
+    Orquestrador Cognitivo Mnemos v2.5:
     - Camadas L1 (Working), L2 (Episodic Ebbinghaus), L3 (Semantic Knowledge Graph)
-    - Auditoria Merkle-DAG + HMAC-SHA256
-    - Defesa ativa contra Memory Poisoning
-    - Persistência SQLite WAL
+    - Quad-Fusion Recall (Vector + Okapi BM25 + Ebbinghaus + Graph Spreading Activation)
+    - Auditoria Merkle-DAG + HMAC-SHA256 com Auto-Cura (Self-Healing)
+    - Persistência e Hidratação Transacional SQLite WAL
     """
 
     def __init__(
@@ -48,12 +55,31 @@ class MnemosEngineV2:
         self._working_queue: List[str] = []
         self._lock = asyncio.Lock()
 
+        if self.store:
+            self._hydrate_from_store()
+
+    def _hydrate_from_store(self) -> None:
+        if not self.store:
+            return
+        loaded_nodes = self.store.load_nodes()
+        loaded_edges = self.store.load_edges()
+        for node in loaded_nodes.values():
+            self._nodes[node.id] = node
+            if node.tier == MemoryTier.WORKING:
+                self._working_queue.append(node.id)
+            if node.parent_hash and node.hmac_signature:
+                h = node.content_hash
+                self.ledger._chain.append(h)
+                self.ledger._snapshots[h] = node.model_copy(deep=True)
+
+        for edge in loaded_edges:
+            self.graph.adj[edge.source_id].append(edge)
+            self.graph.reverse_adj[edge.target_id].append(edge)
+
     @staticmethod
     def _deterministic_ngram_embedding(text: str, dim: int = 64) -> List[float]:
-        """Embedding determinístico baseado em n-gramas e palavras para execução zero-dependência."""
         vec = [0.0] * dim
-        cleaned = "".join(c.lower() if c.isalnum() else " " for c in text)
-        tokens = cleaned.split()
+        tokens = tokenize(text)
         features = list(tokens)
         for token in tokens:
             if len(token) >= 4:
@@ -66,6 +92,43 @@ class MnemosEngineV2:
 
         norm = math.sqrt(sum(x * x for x in vec)) or 1.0
         return [round(x / norm, 6) for x in vec]
+
+    def _compute_bm25_scores(
+        self, query_tokens: List[str], k1: float = 1.5, b: float = 0.75
+    ) -> Dict[str, float]:
+        if not query_tokens or not self._nodes:
+            return {}
+
+        doc_tokens: Dict[str, List[str]] = {
+            nid: tokenize(node.content) for nid, node in self._nodes.items()
+        }
+        total_docs = len(doc_tokens)
+        avgdl = sum(len(t) for t in doc_tokens.values()) / max(1, total_docs)
+
+        df: Counter[str] = Counter()
+        for tokens in doc_tokens.values():
+            for term in set(tokens):
+                df[term] += 1
+
+        raw_scores: Dict[str, float] = {}
+        for nid, tokens in doc_tokens.items():
+            tf = Counter(tokens)
+            doc_len = len(tokens)
+            score = 0.0
+            for q_term in query_tokens:
+                if q_term not in tf:
+                    continue
+                n_q = df[q_term]
+                idf = math.log(((total_docs - n_q + 0.5) / (n_q + 0.5)) + 1.0)
+                freq = tf[q_term]
+                denom = freq + k1 * (1.0 - b + b * (doc_len / max(1.0, avgdl)))
+                score += idf * ((freq * (k1 + 1.0)) / denom)
+            raw_scores[nid] = score
+
+        max_score = max(raw_scores.values(), default=0.0)
+        if max_score <= 0.0:
+            return {nid: 0.0 for nid in self._nodes}
+        return {nid: s / max_score for nid, s in raw_scores.items()}
 
     async def remember(
         self,
@@ -115,11 +178,13 @@ class MnemosEngineV2:
         query: str,
         top_k: int = 5,
         seed_entities: Optional[List[str]] = None,
-        alpha_vector: float = 0.55,
-        beta_retention: float = 0.25,
+        alpha_vector: float = 0.40,
+        delta_bm25: float = 0.20,
+        beta_retention: float = 0.20,
         gamma_graph: float = 0.20,
     ) -> List[Tuple[MemoryNode, float]]:
         query_vec = self.embed(query)
+        query_tokens = tokenize(query)
         now = time.time()
 
         graph_boosts: Dict[str, float] = {}
@@ -129,8 +194,14 @@ class MnemosEngineV2:
         scored_results: List[Tuple[MemoryNode, float]] = []
 
         async with self._lock:
+            if not self.ledger.verify_integrity(self._nodes):
+                self.ledger.heal_live_state(self._nodes)
+
+            bm25_scores = self._compute_bm25_scores(query_tokens)
+
             for node in self._nodes.values():
                 sim = max(0.0, cosine_similarity(query_vec, node.embedding))
+                bm25 = bm25_scores.get(node.id, 0.0)
                 retention = node.retention_score(current_time=now)
 
                 g_score = 0.0
@@ -146,6 +217,7 @@ class MnemosEngineV2:
 
                 final_score = (
                     (alpha_vector * sim)
+                    + (delta_bm25 * bm25)
                     + (beta_retention * retention)
                     + (gamma_graph * g_score)
                 )
@@ -161,6 +233,19 @@ class MnemosEngineV2:
                     node.tier = MemoryTier.SEMANTIC
 
             return top_matches
+
+    async def verify_and_heal(self) -> Dict[str, Any]:
+        async with self._lock:
+            intact_before = self.ledger.verify_integrity(self._nodes)
+            healed_count, healed_ids = self.ledger.heal_live_state(self._nodes)
+            intact_after = self.ledger.verify_integrity(self._nodes)
+            return {
+                "intact_before_healing": intact_before,
+                "healed_nodes_count": healed_count,
+                "healed_node_ids": healed_ids,
+                "intact_after_healing": intact_after,
+                "state_root": self.ledger.compute_state_root(),
+            }
 
     async def consolidate_and_prune(
         self,
@@ -212,11 +297,15 @@ class MnemosEngineV2:
                 if nid in self._working_queue:
                     self._working_queue.remove(nid)
 
+            if self.store:
+                all_edges = [e for edges in self.graph.adj.values() for e in edges]
+                self.store.save_snapshot(self._nodes, all_edges)
+
             return {
                 "pruned_nodes": pruned_count,
                 "merged_nodes": merged_count,
                 "active_nodes": len(self._nodes),
                 "dialectical_conflicts": len(self.graph.conflicts),
-                "ledger_verified": self.ledger.verify_integrity(),
+                "ledger_verified": self.ledger.verify_integrity(self._nodes),
                 "state_root": self.ledger.compute_state_root(),
             }
